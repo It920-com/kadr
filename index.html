@@ -461,6 +461,9 @@
    - Upload path + straighten tool: fully real (canvas rotation).
    - Video crossfade/Ken Burns preview: fully real (CSS).
    - Video export to a downloadable file: fully real (MediaRecorder).
+   - Export finishing: title card, consistent grade, Ken Burns motion, live-video
+     crossfades, room captions, music mix/fades, and branded outro are rendered
+     into the actual exported frames rather than being preview-only effects.
    - Free trial + pricing paywall: FRONT-END ONLY STUB. It currently checks
      localStorage, which anyone can clear or bypass. Before charging real
      money you need the Cloudflare Worker + YooKassa/Robokassa integration
@@ -1325,18 +1328,43 @@ function easeInOutCubic(t){ return t<0.5 ? 4*t*t*t : 1-Math.pow(-2*t+2,3)/2; }
 // and outro alike — so the export reads as one graded piece of footage
 // rather than a stack of untouched phone photos cut together.
 function applyGrade(ctx, canvas){
+  // One restrained finishing pass is applied to every exported frame so
+  // phone photos, uploaded clips, title cards and the outro feel like one
+  // deliberately graded film rather than separate assets.
   const w = canvas.width, h = canvas.height;
-  const g = ctx.createRadialGradient(w/2, h*0.42, h*0.25, w/2, h*0.5, h*0.85);
-  g.addColorStop(0, "rgba(0,0,0,0)");
-  g.addColorStop(1, "rgba(10,4,6,0.55)");
+
+  const vignette = ctx.createRadialGradient(
+    w/2, h*0.42, h*0.22,
+    w/2, h*0.50, h*0.88
+  );
+  vignette.addColorStop(0, "rgba(0,0,0,0)");
+  vignette.addColorStop(0.62, "rgba(0,0,0,0.03)");
+  vignette.addColorStop(1, "rgba(10,4,6,0.52)");
+
   ctx.save();
   ctx.globalCompositeOperation = "multiply";
-  ctx.fillStyle = g;
+  ctx.fillStyle = vignette;
   ctx.fillRect(0,0,w,h);
   ctx.restore();
+
+  // Very subtle burgundy/gold bias to unify mixed phone cameras without
+  // making the site's existing visual identity look different.
   ctx.save();
   ctx.globalCompositeOperation = "overlay";
-  ctx.fillStyle = "rgba(110,31,44,0.06)";
+  ctx.fillStyle = "rgba(110,31,44,0.055)";
+  ctx.fillRect(0,0,w,h);
+  ctx.restore();
+
+  // Gentle top/bottom density gives the footage a more finished, editorial
+  // feel while keeping the room itself readable.
+  const edge = ctx.createLinearGradient(0,0,0,h);
+  edge.addColorStop(0, "rgba(23,10,13,0.09)");
+  edge.addColorStop(0.18, "rgba(23,10,13,0)");
+  edge.addColorStop(0.82, "rgba(23,10,13,0)");
+  edge.addColorStop(1, "rgba(23,10,13,0.16)");
+  ctx.save();
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = edge;
   ctx.fillRect(0,0,w,h);
   ctx.restore();
 }
@@ -1495,10 +1523,12 @@ async function holdVideoAnimated(ctx, canvas, videoEl, rect, durationMs, label){
   }
 }
 
-async function crossfadeDraw(ctx, canvas, drawFrom, drawTo, durationMs){
+async function crossfadeDraw(ctx, canvas, drawFrom, drawTo, durationMs, liveTick){
   const start = performance.now();
   while(performance.now()-start < durationMs){
-    const t = easeInOutCubic((performance.now()-start)/durationMs);
+    const elapsed = performance.now()-start;
+    const t = easeInOutCubic(Math.max(0, Math.min(1, elapsed/durationMs)));
+    if(liveTick) liveTick(elapsed);
     ctx.clearRect(0,0,canvas.width,canvas.height);
     drawFrom(ctx);
     ctx.globalAlpha = t;
@@ -1506,6 +1536,7 @@ async function crossfadeDraw(ctx, canvas, drawFrom, drawTo, durationMs){
     ctx.globalAlpha = 1;
     await new Promise(r=>requestAnimationFrame(r));
   }
+  if(liveTick) liveTick(durationMs);
 }
 
 function isAdminMode(){
@@ -1623,7 +1654,7 @@ async function renderVideoFile(){
   // then immediately pause), and do the real, synced play() right before
   // recorder.start() further down. If anything here fails, the export
   // still proceeds — just silent, rather than blocking the whole video.
-  let audioCtx = null, audioEl = null, audioDest = null, audioReady = false;
+  let audioCtx = null, audioEl = null, audioDest = null, audioGain = null, audioReady = false;
   try{
     audioEl = new Audio(pickMusicTrack());
     audioEl.loop = false;
@@ -1632,10 +1663,15 @@ async function renderVideoFile(){
     const source = audioCtx.createMediaElementSource(audioEl);
     audioDest = audioCtx.createMediaStreamDestination();
     const gain = audioCtx.createGain();
-    gain.gain.value = 0.55; // sits under the visuals, not overpowering
+    gain.gain.value = 0;
     source.connect(gain);
     gain.connect(audioDest);
     gain.connect(audioCtx.destination); // also audible while it renders
+    // Editorial fade-in; fade-out is scheduled once the visual render length
+    // is known below. This avoids an abrupt music start/end in the final file.
+    gain.gain.setValueAtTime(0, audioCtx.currentTime);
+    gain.gain.linearRampToValueAtTime(0.55, audioCtx.currentTime + 0.9);
+    audioGain = gain;
     await audioEl.play();
     audioEl.pause();
     audioEl.currentTime = 0;
@@ -1714,18 +1750,44 @@ async function renderVideoFile(){
     // for video (which keeps playing right through the crossfade for free).
     function frameDrawer(item, edge){
       if(item.type === "video"){
-        return (c)=>{ c.drawImage(item.video, item.rect.sx,item.rect.sy,item.rect.sw,item.rect.sh, 0,0,canvas.width,canvas.height); applyGrade(c, canvas); };
+        return (c)=>{
+          c.drawImage(item.video, item.rect.sx,item.rect.sy,item.rect.sw,item.rect.sh, 0,0,canvas.width,canvas.height);
+          applyGrade(c, canvas);
+        };
       }
       const t = edge === "start" ? 0 : 1;
-      return (c)=>{ const r = kbRect(item.variant, t, bufW, bufH, canvas.width, canvas.height);
-                    c.drawImage(item.buffer, r.sx,r.sy,r.sw,r.sh, 0,0,canvas.width,canvas.height); applyGrade(c, canvas); };
+      return (c)=>{
+        const r = kbRect(item.variant, t, bufW, bufH, canvas.width, canvas.height);
+        c.drawImage(item.buffer, r.sx,r.sy,r.sw,r.sh, 0,0,canvas.width,canvas.height);
+        applyGrade(c, canvas);
+      };
+    }
+
+    async function prepareVideoForCrossfade(item, atEnd){
+      if(item.type !== "video") return;
+      if(atEnd){
+        // Keep the last real frame rather than a frozen frame from the middle.
+        item.video.currentTime = Math.max(0, (item.video.duration || 0.1) - 0.04);
+      }else{
+        item.video.currentTime = 0;
+        try{ await item.video.play(); }catch(e){}
+      }
     }
 
     statusEl.textContent = `Рендер 1/${mediaItems.length}…`;
-    await crossfadeDraw(ctx, canvas,
+    await prepareVideoForCrossfade(mediaItems[0], false);
+    await crossfadeDraw(
+      ctx, canvas,
       c=>c.drawImage(titleImg, 0,0, canvas.width, canvas.height),
       frameDrawer(mediaItems[0], "start"),
-      FADE
+      FADE,
+      (ms)=>{
+        const first = mediaItems[0];
+        if(first.type === "video" && first.video.readyState >= 2){
+          // Advance the live source during the opening dissolve.
+          if(first.video.ended) first.video.currentTime = 0;
+        }
+      }
     );
 
     for(let i=0; i<mediaItems.length; i++){
@@ -1737,7 +1799,23 @@ async function renderVideoFile(){
         await holdPhotoAnimated(ctx, canvas, item.buffer, item.variant, HOLD_PHOTO, bufW, bufH, item.label);
       }
       if(i < mediaItems.length-1){
-        await crossfadeDraw(ctx, canvas, frameDrawer(item, "end"), frameDrawer(mediaItems[i+1], "start"), FADE);
+        const nextItem = mediaItems[i+1];
+        await prepareVideoForCrossfade(item, true);
+        await prepareVideoForCrossfade(nextItem, false);
+        await crossfadeDraw(
+          ctx, canvas,
+          frameDrawer(item, "end"),
+          frameDrawer(nextItem, "start"),
+          FADE,
+          (ms)=>{
+            if(item.type === "video" && item.video.readyState >= 2 && item.video.paused){
+              item.video.play().catch(()=>{});
+            }
+            if(nextItem.type === "video" && nextItem.video.readyState >= 2 && nextItem.video.paused){
+              nextItem.video.play().catch(()=>{});
+            }
+          }
+        );
       }
       if(item.type === "video") item.video.pause();
     }
@@ -1759,6 +1837,13 @@ async function renderVideoFile(){
       }
     }
 
+    if(audioReady && audioGain && audioCtx){
+      const fadeAt = audioCtx.currentTime;
+      audioGain.gain.cancelScheduledValues(fadeAt);
+      audioGain.gain.setValueAtTime(Math.max(0.001, audioGain.gain.value), fadeAt);
+      audioGain.gain.linearRampToValueAtTime(0, fadeAt + 1.0);
+      await sleep(950);
+    }
     recorder.stop();
     await stopped;
     if(audioEl) audioEl.pause();
@@ -1770,7 +1855,7 @@ async function renderVideoFile(){
       <div class="slideshow"><video src="${url}" controls playsinline></video></div>
       <a class="btn-elegant" href="${url}" download="kadr-video.${fileExt}" style="margin-top:10px; text-decoration:none; display:flex;">Скачать файл видео →</a>
     `;
-    statusEl.textContent = `Готово — ${(blob.size/1024).toFixed(0)} КБ, ${mediaItems.length} кадров.`;
+    statusEl.textContent = `Готово — ${(blob.size/1024).toFixed(0)} КБ, ${mediaItems.length} кадров, музыка и плавные переходы.`;
   }catch(e){
     if(audioEl) audioEl.pause();
     if(audioCtx) { try{ audioCtx.close(); }catch(e2){} }
