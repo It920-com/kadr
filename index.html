@@ -461,9 +461,6 @@
    - Upload path + straighten tool: fully real (canvas rotation).
    - Video crossfade/Ken Burns preview: fully real (CSS).
    - Video export to a downloadable file: fully real (MediaRecorder).
-   - Export finishing: title card, consistent grade, Ken Burns motion, live-video
-     crossfades, room captions, music mix/fades, and branded outro are rendered
-     into the actual exported frames rather than being preview-only effects.
    - Free trial + pricing paywall: FRONT-END ONLY STUB. It currently checks
      localStorage, which anyone can clear or bypass. Before charging real
      money you need the Cloudflare Worker + YooKassa/Robokassa integration
@@ -1328,43 +1325,18 @@ function easeInOutCubic(t){ return t<0.5 ? 4*t*t*t : 1-Math.pow(-2*t+2,3)/2; }
 // and outro alike — so the export reads as one graded piece of footage
 // rather than a stack of untouched phone photos cut together.
 function applyGrade(ctx, canvas){
-  // One restrained finishing pass is applied to every exported frame so
-  // phone photos, uploaded clips, title cards and the outro feel like one
-  // deliberately graded film rather than separate assets.
   const w = canvas.width, h = canvas.height;
-
-  const vignette = ctx.createRadialGradient(
-    w/2, h*0.42, h*0.22,
-    w/2, h*0.50, h*0.88
-  );
-  vignette.addColorStop(0, "rgba(0,0,0,0)");
-  vignette.addColorStop(0.62, "rgba(0,0,0,0.03)");
-  vignette.addColorStop(1, "rgba(10,4,6,0.52)");
-
+  const g = ctx.createRadialGradient(w/2, h*0.42, h*0.25, w/2, h*0.5, h*0.85);
+  g.addColorStop(0, "rgba(0,0,0,0)");
+  g.addColorStop(1, "rgba(10,4,6,0.55)");
   ctx.save();
   ctx.globalCompositeOperation = "multiply";
-  ctx.fillStyle = vignette;
+  ctx.fillStyle = g;
   ctx.fillRect(0,0,w,h);
   ctx.restore();
-
-  // Very subtle burgundy/gold bias to unify mixed phone cameras without
-  // making the site's existing visual identity look different.
   ctx.save();
   ctx.globalCompositeOperation = "overlay";
-  ctx.fillStyle = "rgba(110,31,44,0.055)";
-  ctx.fillRect(0,0,w,h);
-  ctx.restore();
-
-  // Gentle top/bottom density gives the footage a more finished, editorial
-  // feel while keeping the room itself readable.
-  const edge = ctx.createLinearGradient(0,0,0,h);
-  edge.addColorStop(0, "rgba(23,10,13,0.09)");
-  edge.addColorStop(0.18, "rgba(23,10,13,0)");
-  edge.addColorStop(0.82, "rgba(23,10,13,0)");
-  edge.addColorStop(1, "rgba(23,10,13,0.16)");
-  ctx.save();
-  ctx.globalCompositeOperation = "source-over";
-  ctx.fillStyle = edge;
+  ctx.fillStyle = "rgba(110,31,44,0.06)";
   ctx.fillRect(0,0,w,h);
   ctx.restore();
 }
@@ -1455,17 +1427,29 @@ function makeCoverBuffer(img, canvas, scaleFactor){
 // static photo into an actual pan or zoom instead of a flat crossfade.
 function kbRect(variant, t, bufW, bufH, cw, ch){
   const tt = easeInOutCubic(Math.max(0, Math.min(1, t)));
-  if(variant === "kb-zoom-in" || variant === "kb-zoom-out"){
-    const zt = variant === "kb-zoom-in" ? tt : 1-tt;
-    const startW = cw*1.16, endW = cw;
-    const sw = startW + (endW-startW)*zt;
-    const sh = sw * (ch/cw);
-    return { sx:(bufW-sw)/2, sy:(bufH-sh)/2, sw, sh };
-  }
-  const sw = cw*1.13, sh = ch*1.13;
-  const maxX = bufW-sw, y = (bufH-sh)/2;
-  const x = variant === "kb-pan-left" ? maxX*(1-tt) : maxX*tt;
-  return { sx:x, sy:y, sw, sh };
+  let startW, endW, panXStart, panXEnd, panYStart, panYEnd;
+  const wide = cw*1.18, tight = cw*1.04, mid = cw*1.13;
+  if(variant === "kb-zoom-in"){ startW=wide; endW=tight; panXStart=0; panXEnd=-0.35; panYStart=0; panYEnd=-0.25; }
+  else if(variant === "kb-zoom-out"){ startW=tight; endW=wide; panXStart=-0.3; panXEnd=0; panYStart=0.2; panYEnd=0; }
+  else if(variant === "kb-pan-left"){ startW=mid; endW=mid; panXStart=1; panXEnd=-1; panYStart=0; panYEnd=0; }
+  else { startW=mid; endW=mid; panXStart=-1; panXEnd=1; panYStart=0; panYEnd=0; }
+
+  const sw = startW + (endW-startW)*tt;
+  const sh = sw * (ch/cw);
+  const maxX = (bufW-sw)/2, maxY = (bufH-sh)/2;
+  const panX = panXStart + (panXEnd-panXStart)*tt;
+  const panY = panYStart + (panYEnd-panYStart)*tt;
+  return { sx: maxX + panX*maxX*0.85, sy: maxY + panY*maxY*0.85, sw, sh };
+}
+
+// Thin cinematic letterbox bars — a classic filmic framing cue, cheap to
+// draw, applied only over the actual photo/video segments (not the brand
+// cards, which don't need it).
+function drawLetterbox(ctx, canvas){
+  const w = canvas.width, h = canvas.height, bar = Math.round(h*0.035);
+  ctx.fillStyle = "rgba(0,0,0,.5)";
+  ctx.fillRect(0,0,w,bar);
+  ctx.fillRect(0,h-bar,w,bar);
 }
 
 // Draws a room-label caption that fades in, holds, then fades out across
@@ -1492,43 +1476,61 @@ function drawCaption(ctx, canvas, label, t){
   ctx.restore();
 }
 
-async function holdPhotoAnimated(ctx, canvas, buffer, variant, durationMs, bufW, bufH, label){
-  const start = performance.now();
-  while(performance.now()-start < durationMs){
-    const t = (performance.now()-start)/durationMs;
-    const r = kbRect(variant, t, bufW, bufH, canvas.width, canvas.height);
-    ctx.clearRect(0,0,canvas.width,canvas.height);
-    ctx.drawImage(buffer, r.sx,r.sy,r.sw,r.sh, 0,0,canvas.width,canvas.height);
-    applyGrade(ctx, canvas);
-    drawCaption(ctx, canvas, label, t);
-    await new Promise(res=>requestAnimationFrame(res));
+
+// Draws whichever media type this item is at local progress t (0..1).
+// Doesn't touch grade/letterbox/caption — callers layer those on top so
+// this can be reused both for the primary draw and the overlap preview.
+function drawMediaAt(ctx, canvas, item, t, bufW, bufH){
+  if(item.type === "video"){
+    ctx.drawImage(item.video, item.rect.sx,item.rect.sy,item.rect.sw,item.rect.sh, 0,0,canvas.width,canvas.height);
+  } else {
+    const r = kbRect(item.variant, t, bufW, bufH, canvas.width, canvas.height);
+    ctx.drawImage(item.buffer, r.sx,r.sy,r.sw,r.sh, 0,0,canvas.width,canvas.height);
   }
 }
 
-// Uploaded video clips need no simulated pan/zoom — they already have real
-// motion. We just play the clip and draw its live frame onto the canvas
-// each tick, looping short clips so they still fill the segment's duration.
-async function holdVideoAnimated(ctx, canvas, videoEl, rect, durationMs, label){
-  videoEl.currentTime = 0;
-  try{ await videoEl.play(); }catch(e){}
-  const start = performance.now();
-  while(performance.now()-start < durationMs){
-    const t = (performance.now()-start)/durationMs;
-    ctx.clearRect(0,0,canvas.width,canvas.height);
-    ctx.drawImage(videoEl, rect.sx,rect.sy,rect.sw,rect.sh, 0,0,canvas.width,canvas.height);
-    applyGrade(ctx, canvas);
-    drawCaption(ctx, canvas, label, t);
-    if(videoEl.ended){ videoEl.currentTime = 0; try{ await videoEl.play(); }catch(e){} }
-    await new Promise(res=>requestAnimationFrame(res));
+// Plays one item for holdMs, and — this is the fix for the "slideshow"
+// feeling — starts fading the next item in during the final fadeMs while
+// THIS item keeps moving right up to the cut, instead of freezing on a
+// static frame the moment the crossfade begins. Photos keep panning/zooming
+// straight through the dissolve; a next-up video just previews its opening
+// frame until it gets its own turn and actually starts playing.
+async function playItem(ctx, canvas, item, nextItem, holdMs, fadeMs, bufW, bufH){
+  if(item.type === "video"){
+    item.video.currentTime = 0;
+    try{ await item.video.play(); }catch(e){}
   }
-}
-
-async function crossfadeDraw(ctx, canvas, drawFrom, drawTo, durationMs, liveTick){
   const start = performance.now();
-  while(performance.now()-start < durationMs){
+  while(true){
     const elapsed = performance.now()-start;
-    const t = easeInOutCubic(Math.max(0, Math.min(1, elapsed/durationMs)));
-    if(liveTick) liveTick(elapsed);
+    if(elapsed >= holdMs) break;
+    const t = elapsed/holdMs;
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    drawMediaAt(ctx, canvas, item, t, bufW, bufH);
+    if(item.type === "video" && item.video.ended){
+      item.video.currentTime = 0; try{ await item.video.play(); }catch(e){}
+    }
+    applyGrade(ctx, canvas);
+    drawLetterbox(ctx, canvas);
+    drawCaption(ctx, canvas, item.label, t);
+    if(nextItem && elapsed > holdMs-fadeMs){
+      const fadeT = Math.min(1, (elapsed-(holdMs-fadeMs))/fadeMs);
+      const nextLocalT = nextItem.type === "video" ? 0 : fadeT*0.18;
+      ctx.save();
+      ctx.globalAlpha = easeInOutCubic(fadeT);
+      drawMediaAt(ctx, canvas, nextItem, nextLocalT, bufW, bufH);
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    }
+    await new Promise(res=>requestAnimationFrame(res));
+  }
+  if(item.type === "video") item.video.pause();
+}
+
+async function crossfadeDraw(ctx, canvas, drawFrom, drawTo, durationMs){
+  const start = performance.now();
+  while(performance.now()-start < durationMs){
+    const t = easeInOutCubic((performance.now()-start)/durationMs);
     ctx.clearRect(0,0,canvas.width,canvas.height);
     drawFrom(ctx);
     ctx.globalAlpha = t;
@@ -1536,7 +1538,6 @@ async function crossfadeDraw(ctx, canvas, drawFrom, drawTo, durationMs, liveTick
     ctx.globalAlpha = 1;
     await new Promise(r=>requestAnimationFrame(r));
   }
-  if(liveTick) liveTick(durationMs);
 }
 
 function isAdminMode(){
@@ -1654,7 +1655,7 @@ async function renderVideoFile(){
   // then immediately pause), and do the real, synced play() right before
   // recorder.start() further down. If anything here fails, the export
   // still proceeds — just silent, rather than blocking the whole video.
-  let audioCtx = null, audioEl = null, audioDest = null, audioGain = null, audioReady = false;
+  let audioCtx = null, audioEl = null, audioDest = null, audioReady = false;
   try{
     audioEl = new Audio(pickMusicTrack());
     audioEl.loop = false;
@@ -1663,15 +1664,10 @@ async function renderVideoFile(){
     const source = audioCtx.createMediaElementSource(audioEl);
     audioDest = audioCtx.createMediaStreamDestination();
     const gain = audioCtx.createGain();
-    gain.gain.value = 0;
+    gain.gain.value = 0.55; // sits under the visuals, not overpowering
     source.connect(gain);
     gain.connect(audioDest);
     gain.connect(audioCtx.destination); // also audible while it renders
-    // Editorial fade-in; fade-out is scheduled once the visual render length
-    // is known below. This avoids an abrupt music start/end in the final file.
-    gain.gain.setValueAtTime(0, audioCtx.currentTime);
-    gain.gain.linearRampToValueAtTime(0.55, audioCtx.currentTime + 0.9);
-    audioGain = gain;
     await audioEl.play();
     audioEl.pause();
     audioEl.currentTime = 0;
@@ -1743,81 +1739,39 @@ async function renderVideoFile(){
     // Assign each photo a Ken Burns variant up front so the same variant
     // is used consistently for both its hold and the crossfades either
     // side of it. Video items don't need one — they have real motion.
-    mediaItems.forEach((item, i)=>{ if(item.type === "photo") item.variant = KB_VARIANTS[i%KB_VARIANTS.length]; });
+    // Every item also gets a holdMs so playItem() has one consistent field
+    // to read regardless of media type.
+    mediaItems.forEach((item, i)=>{
+      if(item.type === "photo"){ item.variant = KB_VARIANTS[i%KB_VARIANTS.length]; item.holdMs = HOLD_PHOTO; }
+    });
 
-    // Returns a (ctx)=>void drawer for a still frame of this item — "start"
-    // or "end" of its motion for photos, or just its current live frame
-    // for video (which keeps playing right through the crossfade for free).
+    // Returns a (ctx)=>void drawer for a still frame of this item — used
+    // only for the two brand-card transitions (title-in, outro-out), which
+    // don't need the continuous-motion overlap the tour segments get.
     function frameDrawer(item, edge){
       if(item.type === "video"){
-        return (c)=>{
-          c.drawImage(item.video, item.rect.sx,item.rect.sy,item.rect.sw,item.rect.sh, 0,0,canvas.width,canvas.height);
-          applyGrade(c, canvas);
-        };
+        return (c)=>{ c.drawImage(item.video, item.rect.sx,item.rect.sy,item.rect.sw,item.rect.sh, 0,0,canvas.width,canvas.height); applyGrade(c, canvas); };
       }
       const t = edge === "start" ? 0 : 1;
-      return (c)=>{
-        const r = kbRect(item.variant, t, bufW, bufH, canvas.width, canvas.height);
-        c.drawImage(item.buffer, r.sx,r.sy,r.sw,r.sh, 0,0,canvas.width,canvas.height);
-        applyGrade(c, canvas);
-      };
-    }
-
-    async function prepareVideoForCrossfade(item, atEnd){
-      if(item.type !== "video") return;
-      if(atEnd){
-        // Keep the last real frame rather than a frozen frame from the middle.
-        item.video.currentTime = Math.max(0, (item.video.duration || 0.1) - 0.04);
-      }else{
-        item.video.currentTime = 0;
-        try{ await item.video.play(); }catch(e){}
-      }
+      return (c)=>{ const r = kbRect(item.variant, t, bufW, bufH, canvas.width, canvas.height);
+                    c.drawImage(item.buffer, r.sx,r.sy,r.sw,r.sh, 0,0,canvas.width,canvas.height); applyGrade(c, canvas); };
     }
 
     statusEl.textContent = `Рендер 1/${mediaItems.length}…`;
-    await prepareVideoForCrossfade(mediaItems[0], false);
-    await crossfadeDraw(
-      ctx, canvas,
+    await crossfadeDraw(ctx, canvas,
       c=>c.drawImage(titleImg, 0,0, canvas.width, canvas.height),
       frameDrawer(mediaItems[0], "start"),
-      FADE,
-      (ms)=>{
-        const first = mediaItems[0];
-        if(first.type === "video" && first.video.readyState >= 2){
-          // Advance the live source during the opening dissolve.
-          if(first.video.ended) first.video.currentTime = 0;
-        }
-      }
+      FADE
     );
 
     for(let i=0; i<mediaItems.length; i++){
       statusEl.textContent = `Рендер ${i+1}/${mediaItems.length}…`;
       const item = mediaItems[i];
-      if(item.type === "video"){
-        await holdVideoAnimated(ctx, canvas, item.video, item.rect, item.holdMs, item.label);
-      } else {
-        await holdPhotoAnimated(ctx, canvas, item.buffer, item.variant, HOLD_PHOTO, bufW, bufH, item.label);
-      }
-      if(i < mediaItems.length-1){
-        const nextItem = mediaItems[i+1];
-        await prepareVideoForCrossfade(item, true);
-        await prepareVideoForCrossfade(nextItem, false);
-        await crossfadeDraw(
-          ctx, canvas,
-          frameDrawer(item, "end"),
-          frameDrawer(nextItem, "start"),
-          FADE,
-          (ms)=>{
-            if(item.type === "video" && item.video.readyState >= 2 && item.video.paused){
-              item.video.play().catch(()=>{});
-            }
-            if(nextItem.type === "video" && nextItem.video.readyState >= 2 && nextItem.video.paused){
-              nextItem.video.play().catch(()=>{});
-            }
-          }
-        );
-      }
-      if(item.type === "video") item.video.pause();
+      const next = i < mediaItems.length-1 ? mediaItems[i+1] : null;
+      // playItem handles this item's hold AND the crossfade into the next
+      // one internally, keeping the camera moving right through the cut —
+      // that continuity is what stops it reading as a slideshow.
+      await playItem(ctx, canvas, item, next, item.holdMs, FADE, bufW, bufH);
     }
 
     // Outro — crossfade the last shot to black, then let the mark spin
@@ -1837,13 +1791,6 @@ async function renderVideoFile(){
       }
     }
 
-    if(audioReady && audioGain && audioCtx){
-      const fadeAt = audioCtx.currentTime;
-      audioGain.gain.cancelScheduledValues(fadeAt);
-      audioGain.gain.setValueAtTime(Math.max(0.001, audioGain.gain.value), fadeAt);
-      audioGain.gain.linearRampToValueAtTime(0, fadeAt + 1.0);
-      await sleep(950);
-    }
     recorder.stop();
     await stopped;
     if(audioEl) audioEl.pause();
@@ -1855,7 +1802,7 @@ async function renderVideoFile(){
       <div class="slideshow"><video src="${url}" controls playsinline></video></div>
       <a class="btn-elegant" href="${url}" download="kadr-video.${fileExt}" style="margin-top:10px; text-decoration:none; display:flex;">Скачать файл видео →</a>
     `;
-    statusEl.textContent = `Готово — ${(blob.size/1024).toFixed(0)} КБ, ${mediaItems.length} кадров, музыка и плавные переходы.`;
+    statusEl.textContent = `Готово — ${(blob.size/1024).toFixed(0)} КБ, ${mediaItems.length} кадров.`;
   }catch(e){
     if(audioEl) audioEl.pause();
     if(audioCtx) { try{ audioCtx.close(); }catch(e2){} }
